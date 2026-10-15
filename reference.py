@@ -1,194 +1,224 @@
+"""Generate superpoints for every ABC HDF5 file using multiple processes.
+
+Run from the project directory in hpnet_ifb:
+    python ABC_superpoints_code/abc_superpoints_batch.py --workers 8
+
+Input defaults are inherited from abc_superpoints_singlefile.py. Outputs go to
+/data/users/wm-sharath/fib/ABC_final_geon_superpoints/ and
+/data/users/wm-sharath/fib/ABC_final_abc_superpoints/ by default.
+Normals and segmentation defaults match that script. Each process uses one
+native thread, while files are processed in parallel. Both existing outputs
+are skipped unless --overwrite is supplied. A partial output pair is rebuilt.
+Use --overwrite after changing segmentation settings to regenerate results.
+Each run writes a CSV report with successes, skips, and errors. Failed files
+are retried on the next run. --limit 10 allows a small trial before a full run.
+"""
+
 from __future__ import annotations
 
 import argparse
-import json
-import random
-import tempfile
+import csv
+import math
+import multiprocessing
+import os
+import sys
+import time
+import traceback
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
+from datetime import datetime
 from pathlib import Path
 
-import h5py
-import numpy as np
 
-from geon.algorithms.superpoints import segment_superpoints
-from geon.data.document import Document
-from geon.data.pointcloud import FieldType, PointCloudData
+_WORKER_CONFIG = None
+_SINGLEFILE = None
 
 
-DEFAULT_INPUT_DIR = Path(r"D:\GIA\ABC\ABC_final")
-DEFAULT_GEON_OUTPUT_DIR = Path(r"D:\GIA\ABC\ABC_final_geon_superpoints")
-DEFAULT_ABC_OUTPUT_DIR = Path(r"D:\GIA\ABC\ABC_final_abc_superpoints")
+def limit_native_threads() -> None:
+    # Set before importing numpy/geon, including in Windows spawned workers.
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"):
+        os.environ[name] = "1"
 
 
-def select_file(input_dir: Path, seed: int | None) -> Path:
-    """Choose uniformly from the HDF5 files directly inside input_dir."""
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
-    candidates = sorted(
-        path for path in input_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".h5", ".hdf5"}
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No HDF5 files found in {input_dir}")
-    return random.Random(seed).choice(candidates)
+def initialize_worker(config: dict) -> None:
+    global _WORKER_CONFIG, _SINGLEFILE
+    limit_native_threads()
+    import abc_superpoints_singlefile as singlefile
+    _WORKER_CONFIG = config
+    _SINGLEFILE = singlefile
 
 
-def load_abc_as_geon(source: Path) -> PointCloudData:
-    """Convert ABC root datasets to geon's typed point-cloud fields."""
-    with h5py.File(source, "r") as handle:
-        required = {"points", "normals", "labels", "prim", "T_param"}
-        missing = required.difference(handle.keys())
-        if missing:
-            raise ValueError(f"{source.name}: missing ABC datasets {sorted(missing)}")
-        arrays = {name: handle[name][()] for name in required}
-
-    # The native algorithm requires contiguous float32 coordinates of shape N x 3.
-    points = np.ascontiguousarray(arrays["points"], dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 2:
-        raise ValueError(f"Expected at least two points with shape (N, 3), got {points.shape}")
-    if not np.isfinite(points).all():
-        raise ValueError("Coordinates contain NaN or infinity")
-    cloud = PointCloudData(points)
-
-    normals = np.ascontiguousarray(arrays["normals"], dtype=np.float32)
-    if normals.shape != points.shape or not np.isfinite(normals).all():
-        raise ValueError("Normals must be finite and have the same (N, 3) shape as points")
-    lengths = np.linalg.norm(normals.astype(np.float64), axis=1)
-    if np.any(lengths == 0):
-        raise ValueError("Zero-length normals cannot be used as segmentation features")
-    normals = np.ascontiguousarray(normals / lengths[:, None], dtype=np.float32)
-    cloud.add_field(name="normals", data=normals, field_type=FieldType.NORMAL)
-
-    for name, field_type in (("labels", FieldType.INSTANCE), ("prim", FieldType.SCALAR)):
-        values = arrays[name]
-        if values.shape not in {(len(points),), (len(points), 1)}:
-            raise ValueError(f"{name} must contain one value per point, got {values.shape}")
-        if not np.issubdtype(values.dtype, np.integer):
-            raise ValueError(f"{name} must contain integer IDs, got {values.dtype}")
-        # Generic geon fields require N x F; instance fields also accept flat IDs.
-        cloud.add_field(name=name, data=values.reshape(-1, 1), field_type=field_type)
-
-    parameters = arrays["T_param"]
-    if parameters.ndim != 2 or parameters.shape[0] != len(points) or parameters.shape[1] == 0:
-        raise ValueError(f"T_param must have shape (N, F), got {parameters.shape}")
-    cloud.add_field(name="T_param", data=parameters, field_type=FieldType.VECTOR)
-    return cloud
-
-
-def save_outputs(
-    source: Path,
-    geon_output_dir: Path,
-    abc_output_dir: Path,
-    cloud: PointCloudData,
-    superpoints: np.ndarray,
-    settings: dict,
-    *,
-    overwrite: bool = False,
-) -> tuple[Path, Path]:
-    """Save a geon document and an ABC-compatible copy without changing source."""
-    geon_output_dir.mkdir(parents=True, exist_ok=True)
-    abc_output_dir.mkdir(parents=True, exist_ok=True)
-    geon_path = geon_output_dir / f"{source.stem}_geon_superpoints.h5"
-    abc_path = abc_output_dir / f"{source.stem}_abc_superpoints.h5"
-    for destination, option in (
-        (geon_path, "--geon-output-dir"), (abc_path, "--abc-output-dir")
-    ):
-        if destination.resolve() == source.resolve():
-            raise ValueError(f"Output would overwrite the input: {destination}")
-        if destination.exists() and not overwrite:
-            raise FileExistsError(f"Output already exists; choose another {option}: {destination}")
-
-    cloud.add_field(name="superpoints", data=superpoints, field_type=FieldType.INSTANCE)
-    document = Document(name=f"ABC_{source.stem}_superpoints")
-    document.add_data(cloud)
-    metadata = json.dumps(settings, sort_keys=True)
-
-    # Prepare complete files before moving them into their final locations.
-    with (
-        tempfile.TemporaryDirectory(prefix="geon_superpoints_", dir=geon_output_dir) as temporary_geon_dir,
-        tempfile.TemporaryDirectory(prefix="abc_superpoints_", dir=abc_output_dir) as temporary_abc_dir,
-    ):
-        temporary_geon = Path(temporary_geon_dir) / geon_path.name
-        temporary_abc = Path(temporary_abc_dir) / abc_path.name
-        document.save_hdf5(temporary_geon)
-        with h5py.File(temporary_geon, "a") as handle:
-            handle.attrs["source_abc_file"] = str(source.resolve())
-            handle.attrs["superpoint_settings"] = metadata
-
-        with h5py.File(source, "r") as original, h5py.File(temporary_abc, "w") as target:
-            for name in original:
-                original.copy(name, target)
-            for key, value in original.attrs.items():
-                target.attrs[key] = value
-            if "superpoints" in target:
-                raise ValueError("Input already contains a superpoints dataset")
-            target.create_dataset("superpoints", data=superpoints, compression="gzip")
-            target.attrs["source_abc_file"] = str(source.resolve())
-            target.attrs["superpoint_settings"] = metadata
-        temporary_geon.replace(geon_path)
-        temporary_abc.replace(abc_path)
-    return geon_path, abc_path
+def process_file(source: Path) -> dict:
+    """Only small result records cross process boundaries, never point arrays."""
+    started = time.perf_counter()
+    config = _WORKER_CONFIG
+    singlefile = _SINGLEFILE
+    geon_path = config["geon_output_dir"] / f"{source.stem}_geon_superpoints.h5"
+    abc_path = config["abc_output_dir"] / f"{source.stem}_abc_superpoints.h5"
+    result = {"source": str(source), "status": "", "points": "",
+              "superpoints": "", "seconds": "", "geon_output": str(geon_path),
+              "abc_output": str(abc_path), "error": ""}
+    try:
+        if geon_path.is_file() and abc_path.is_file() and not config["overwrite"]:
+            result["status"] = "skipped"
+        else:
+            cloud = singlefile.load_abc_as_geon(source)
+            settings = config["settings"]
+            if settings["k_neighbors"] >= len(cloud.points):
+                raise ValueError("k-neighbors must be smaller than the number of points")
+            labels, stats = singlefile.segment_superpoints(
+                cloud, feature_field_names=config["feature_names"], **settings
+            )
+            np = singlefile.np
+            if stats.get("cancelled") or labels.shape != (len(cloud.points),) or np.any(labels < 0):
+                raise RuntimeError("geon did not return a valid superpoint ID for every point")
+            # Replace partial pairs together so both files contain the same IDs.
+            singlefile.save_outputs(
+                source, config["geon_output_dir"], config["abc_output_dir"],
+                cloud, labels,
+                {**settings, "feature_field_names": config["feature_names"], "selection_seed": None},
+                overwrite=True,
+            )
+            result.update(status="success", points=len(cloud.points),
+                          superpoints=len(np.unique(labels)))
+    except Exception:
+        result.update(status="failed", error=traceback.format_exc())
+    result["seconds"] = round(time.perf_counter() - started, 3)
+    return result
 
 
 def parse_args() -> argparse.Namespace:
+    import abc_superpoints_singlefile as singlefile
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
-    parser.add_argument("--input-file", type=Path, help="Process a specific file instead of choosing randomly")
-    parser.add_argument("--geon-output-dir", type=Path, default=DEFAULT_GEON_OUTPUT_DIR,
-                        help="Directory for native geon documents")
-    parser.add_argument("--abc-output-dir", type=Path, default=DEFAULT_ABC_OUTPUT_DIR,
-                        help="Directory for ABC data with superpoint IDs")
-    parser.add_argument("--seed", type=int, help="Reproduce the random file choice for an unchanged directory")
+    parser.add_argument("--input-dir", type=Path, default=singlefile.DEFAULT_INPUT_DIR)
+    parser.add_argument("--geon-output-dir", type=Path,
+                        default=Path("/data/users/wm-sharath/fib/ABC_final_geon_superpoints/"))
+    parser.add_argument("--abc-output-dir", type=Path,
+                        default=Path("/data/users/wm-sharath/fib/ABC_final_abc_superpoints/"))
+    parser.add_argument("--workers", type=int, default=min(8, max(1, (os.cpu_count() or 2) - 1)),
+                        help="Number of worker processes (default: up to 8)")
+    parser.add_argument("--limit", type=int, help="Process only the first N sorted input files")
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate even when both outputs exist")
+    parser.add_argument("--log-file", type=Path, help="CSV report path; default: batch_logs next to this script")
+    parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--k-neighbors", type=int, default=10)
     parser.add_argument("--regularization", type=float, default=0.05)
     parser.add_argument("--spatial-weight", type=float, default=1.0)
     parser.add_argument("--cutoff", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--coordinates-only", action="store_true", help="Segment without normal features")
-    parser.add_argument("--serial", action="store_true", help="Disable parallel execution in geon")
-    parser.add_argument("--verbose", action="store_true", help="Print geon's algorithm progress")
+    parser.add_argument("--coordinates-only", action="store_true")
     args = parser.parse_args()
-    if args.k_neighbors < 1 or args.cutoff < 1 or args.iterations < 1:
-        parser.error("k-neighbors, cutoff, and iterations must be positive")
-    if not np.isfinite(args.regularization) or args.regularization <= 0:
-        parser.error("regularization must be finite and positive")
-    if not np.isfinite(args.spatial_weight) or args.spatial_weight < 0:
-        parser.error("spatial-weight must be finite and nonnegative")
+    for name in ("workers", "progress_every", "k_neighbors", "cutoff", "iterations"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be positive")
+    if not math.isfinite(args.regularization) or args.regularization <= 0:
+        parser.error("--regularization must be finite and positive")
+    if not math.isfinite(args.spatial_weight) or args.spatial_weight < 0:
+        parser.error("--spatial-weight must be finite and nonnegative")
+    if not args.input_dir.is_dir():
+        parser.error(f"Input directory does not exist: {args.input_dir}")
     return args
 
 
-def main() -> None:
+def main() -> int:
+    limit_native_threads()
     args = parse_args()
-    source = (args.input_file or select_file(args.input_dir, args.seed)).resolve()
-    print(f"Selected ABC file: {source}", flush=True)
-    cloud = load_abc_as_geon(source)
-    if args.k_neighbors >= len(cloud.points):
-        raise ValueError("k-neighbors must be smaller than the number of points")
-    settings = {
-        "k_neighbors": args.k_neighbors,
-        "regularization": args.regularization,
-        "spatial_weight": args.spatial_weight,
-        "cutoff": args.cutoff,
-        "iterations": args.iterations,
-        "parallel": not args.serial,
+    files = sorted(path.resolve() for path in args.input_dir.iterdir()
+                   if path.is_file() and path.suffix.lower() in {".h5", ".hdf5"})
+    if args.limit:
+        files = files[:args.limit]
+    if not files:
+        print(f"No HDF5 files found in {args.input_dir}", file=sys.stderr)
+        return 1
+    # Different extensions with the same stem must not target the same output.
+    stems = [path.stem.casefold() for path in files]
+    if len(set(stems)) != len(stems):
+        print("Input files have duplicate stems; output filenames would collide.", file=sys.stderr)
+        return 1
+
+    args.geon_output_dir = args.geon_output_dir.resolve()
+    args.abc_output_dir = args.abc_output_dir.resolve()
+    for directory in (args.geon_output_dir, args.abc_output_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    log_path = args.log_file or (
+        Path(__file__).resolve().parent / "batch_logs" /
+        f"superpoints_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
+    )
+    log_path = log_path.resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "geon_output_dir": args.geon_output_dir, "abc_output_dir": args.abc_output_dir,
+        "overwrite": args.overwrite,
+        "feature_names": [] if args.coordinates_only else ["normals"],
+        "settings": {"k_neighbors": args.k_neighbors, "regularization": args.regularization,
+                     "spatial_weight": args.spatial_weight, "cutoff": args.cutoff,
+                     "iterations": args.iterations, "parallel": False},
     }
-    feature_names = [] if args.coordinates_only else ["normals"]
-    print(f"Points: {len(cloud.points)}; feature fields: {feature_names}", flush=True)
-    superpoints, stats = segment_superpoints(
-        cloud, feature_field_names=feature_names, verbose=args.verbose, **settings
-    )
-    if superpoints.shape != (len(cloud.points),) or np.any(superpoints < 0):
-        raise RuntimeError("geon did not return a valid superpoint ID for every point")
-    ids, counts = np.unique(superpoints, return_counts=True)
-    geon_path, abc_path = save_outputs(
-        source, args.geon_output_dir, args.abc_output_dir, cloud, superpoints,
-        {**settings, "feature_field_names": feature_names, "selection_seed": args.seed},
-    )
-    print(f"Superpoints: {len(ids)}; group sizes: {counts.min()}..{counts.max()}")
-    print(f"geon statistics: {stats}")
-    print(f"geon document: {geon_path}")
-    print(f"ABC data with superpoints: {abc_path}")
+    workers = min(args.workers, len(files))
+    print(f"Files: {len(files)}; workers: {workers}; features: {config['feature_names']}", flush=True)
+    print(f"Input: {args.input_dir.resolve()}\ngeon output: {args.geon_output_dir}\n"
+          f"ABC output: {args.abc_output_dir}\nCSV report: {log_path}", flush=True)
+    counts = {"success": 0, "skipped": 0, "failed": 0}
+    started = time.perf_counter()
+    exit_code = 0
+    columns = ["source", "status", "points", "superpoints", "seconds",
+               "geon_output", "abc_output", "error"]
+    # Exclusive creation prevents an explicit log path from truncating an old report.
+    with log_path.open("x", newline="", encoding="utf-8") as report:
+        writer = csv.DictWriter(report, fieldnames=columns)
+        writer.writeheader()
+        report.flush()
+        pool = ProcessPoolExecutor(max_workers=workers,
+                                   mp_context=multiprocessing.get_context("spawn"),
+                                   initializer=initialize_worker, initargs=(config,))
+        pending = {}
+        source_iterator = iter(files)
+
+        def submit_next() -> bool:
+            source = next(source_iterator, None)
+            if source is None:
+                return False
+            pending[pool.submit(process_file, source)] = source
+            return True
+
+        try:
+            # Bound the queue instead of submitting all 32,113 files at once.
+            for _ in range(workers * 2):
+                if not submit_next():
+                    break
+            while pending:
+                completed, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    source = pending.pop(future)
+                    result = future.result()
+                    writer.writerow(result)
+                    report.flush()
+                    counts[result["status"]] += 1
+                    done = sum(counts.values())
+                    if result["status"] == "failed":
+                        print(f"FAILED {source.name}: {result['error'].strip().splitlines()[-1]}", flush=True)
+                    if done % args.progress_every == 0 or done == len(files):
+                        print(f"[{done}/{len(files)}] success={counts['success']} "
+                              f"skipped={counts['skipped']} failed={counts['failed']} "
+                              f"elapsed={time.perf_counter() - started:.1f}s", flush=True)
+                    submit_next()
+        except KeyboardInterrupt:
+            print("\nInterrupted. Waiting for active files; rerun to continue.", flush=True)
+            exit_code = 130
+        except BrokenProcessPool as error:
+            print(f"Worker process stopped unexpectedly: {error}. Rerun to continue.", file=sys.stderr)
+            exit_code = 1
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+    print(f"Finished: success={counts['success']}, skipped={counts['skipped']}, "
+          f"failed={counts['failed']}; elapsed={time.perf_counter() - started:.1f}s\n"
+          f"CSV report: {log_path}", flush=True)
+    return exit_code or (1 if counts["failed"] else 0)
 
 
 if __name__ == "__main__":
-    main()
-
+    multiprocessing.freeze_support()
+    raise SystemExit(main())
