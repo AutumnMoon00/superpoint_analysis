@@ -34,8 +34,12 @@ conda activate "${CONDA_ENV:-hpnet_l40s}"
 set -u
 
 INPUT_DIR="${INPUT_DIR:-/data/users/wm-sharath/fib/ABC_final/}"
-ABC_OUTPUT_DIR="${ABC_OUTPUT_DIR:-/data/users/wm-sharath/fib/ABC_final_abc_superpoints/}"
-GEON_OUTPUT_DIR="${GEON_OUTPUT_DIR:-/data/users/wm-sharath/fib/ABC_final_geon_superpoints/}"
+# ABC_OUTPUT_DIR="${ABC_OUTPUT_DIR:-/data/users/wm-sharath/fib/ABC_final_abc_superpoints/}"
+# GEON_OUTPUT_DIR="${GEON_OUTPUT_DIR:-/data/users/wm-sharath/fib/ABC_final_geon_superpoints/}"
+
+ABC_OUTPUT_DIR="${ABC_OUTPUT_DIR:-/mnt/gpu_data_storage/sharath/ABC/ABC_final_abc_superpoints/}"
+GEON_OUTPUT_DIR="${GEON_OUTPUT_DIR:-/mnt/gpu_data_storage/sharath/ABC/ABC_final_geon_superpoints/}"
+
 
 # Each Python worker uses one native thread; parallelism is across files.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1

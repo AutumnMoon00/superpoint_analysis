@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--k-neighbors", type=int, default=10)
     parser.add_argument("--regularizations", "--regularization", dest="regularizations",
-                        type=float, nargs="+", default=[0.1],
+                        type=float, nargs="+", default=[0.025],
                         help="Regularization values to run (default: 0.025 0.05 0.1)")
     parser.add_argument("--spatial-weight", type=float, default=1.0)
     parser.add_argument("--cutoff", type=int, default=10)
